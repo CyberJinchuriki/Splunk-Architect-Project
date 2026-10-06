@@ -1,0 +1,689 @@
+# Splunk Architecture Capstone Project
+
+## Overview
+
+This project documents the build and configuration of a distributed Splunk environment hosted on AWS. The architecture includes an indexer cluster, a search head cluster, centralized deployment components, and a Universal Forwarder used to collect and forward log data.
+
+
+> **Security note:** Credentials, shared secrets, and environment-specific IP addresses have been replaced with placeholders in this public version. Do not commit real passwords, `pass4SymmKey` values, private keys, or other secrets to a public GitHub repository.
+
+## Architecture Components
+
+The lab uses the following Splunk roles:
+
+- **Cluster Manager (CM)** - manages the indexer cluster.
+- **Indexers (IDX)** - receive, index, replicate, and store data.
+- **Deployer (DP)** - distributes apps and configuration bundles to the search head cluster.
+- **Search Heads (SH)** - provide the search and investigation layer.
+- **Deployment Server (DS)** - centrally manages apps and configurations for Universal Forwarders.
+- **Universal Forwarder (UF)** - collects logs from the monitored Linux host and forwards them to the indexer tier.
+
+The AWS build documented in the source used Amazon Linux instances. Most Splunk Enterprise nodes used `t2.medium` instances with 16 GiB gp3 root volumes, while the Universal Forwarder host used a `t3.micro` instance with an 8 GiB gp3 root volume.
+
+## Network Ports Used in the Lab
+
+The source project documented the following ports in the AWS security group:
+
+| Port | Documented Purpose |
+| --- | --- |
+| `8000` | Splunk Web |
+| `8080` | Indexer replication |
+| `9887` | Indexer replication |
+| `8081` | Search head replication |
+| `8181` | Search head replication |
+| `8088` | HTTP Event Collector (HEC) |
+| `8191` | KV Store replication |
+| `9997` | Splunk receiving port for Universal Forwarders |
+| `9998` | Documented SSL receiving port for Universal Forwarders |
+
+> **Important:** This table preserves the ports recorded in the original capstone. Before using this design outside the lab, validate the required ports against the Splunk configuration you actually deploy and restrict AWS security-group sources appropriately. Avoid exposing management, replication, ingestion, or Splunk Web ports broadly to the internet.
+
+---
+
+# Implementation
+
+----------------------------------------------------------------------------------------------------------------------------
+
+## 1. Create the AWS Security Group
+
+A security group named `splunk-lab` was created under **Network & Security > Security Groups**. The ports required by the lab were then added as inbound rules.
+
+For a real environment, scope each rule to only the systems or network ranges that require access instead of allowing unrestricted sources.
+
+------------------------------------------------------------------------------------------------------------------------------
+
+## 2. Create the AWS Instances
+
+The Splunk Enterprise instances were created with the following documented settings:
+
+- **AMI:** Amazon Linux
+- **Instance type:** `t2.medium`
+- **Key pair:** `splunk_labs`
+- **Security group:** `splunk-lab`
+- **Storage:** 16 GiB gp3 root volume, 3000 IOPS, unencrypted in the original lab
+
+The Universal Forwarder host used:
+
+- **Instance type:** `t3.micro`
+- **Storage:** 8 GiB gp3 root volume
+
+-----------------------------------------------------------------------------------------------------------------------
+
+## 3. Install Splunk Enterprise
+
+Download the appropriate Splunk Enterprise Linux `.tgz` package on each Splunk Enterprise node and extract it under `/opt`:
+
+```bash
+sudo tar -zxvf <splunk-enterprise-package.tgz> -C /opt/
+```
+
+Create a dedicated `splunk` account and assign ownership of the Splunk installation:
+
+```bash
+sudo adduser splunk
+sudo chown -R splunk:splunk /opt/splunk/
+```
+
+Start Splunk as the dedicated account and accept the license:
+
+```bash
+sudo -u splunk /opt/splunk/bin/splunk start --accept-license --answer-yes
+```
+
+The original lab used a locally selected administrator credential. That credential is intentionally omitted from this public README.
+
+### Lab-specific disk threshold setting
+
+The capstone changed **Settings > Server settings > General settings > Index settings > Pausing indexing if free disk space falls below** to `1 MB`.
+
+> This is documented as a **lab-specific setting**, not a production recommendation. A production deployment should retain an appropriately protective free-disk threshold.
+
+### Validation
+
+Confirm that:
+
+- Splunk starts successfully on every applicable node.
+- The dedicated `splunk` account owns the Splunk files and processes.
+- Required Splunk services are reachable where appropriate.
+
+-----------------------------------------------------------------------------------------------------------------------
+
+## 4. Create a Splunk CLI Alias
+
+To avoid repeatedly entering the full Splunk binary path, add the following alias to `~/.bashrc`:
+
+```bash
+alias splunk='/opt/splunk/bin/splunk'
+```
+
+Reload the shell configuration:
+
+```bash
+source ~/.bashrc
+```
+
+Afterward, commands such as the following can be run directly:
+
+```bash
+splunk status
+```
+
+-------------------------------------------------------------------------------------------------------------------------
+
+## 5. Disable Splunk Web on the Indexers
+
+The lab disables Splunk Web on indexers so that users perform searches through the search tier rather than directly on individual indexers.
+
+Edit:
+
+```text
+/opt/splunk/etc/system/local/web.conf
+```
+
+Add:
+
+```ini
+[settings]
+startwebserver = false
+```
+
+Restart Splunk:
+
+```bash
+/opt/splunk/bin/splunk restart
+```
+
+### Validation
+
+Verify that Splunk Web is no longer accessible on the indexers while `splunkd` continues to operate.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 6. Configure the Cluster Manager
+
+On the Cluster Manager, edit:
+
+```text
+/opt/splunk/etc/system/local/server.conf
+```
+
+Add the clustering configuration used by the lab:
+
+```ini
+[clustering]
+mode = manager
+replication_factor = 2
+search_factor = 1
+pass4SymmKey = <INDEXER_CLUSTER_SECRET>
+cluster_label = main_cluster
+```
+
+Restart Splunk after saving the configuration.
+
+### Validation
+
+Inspect the effective configuration and verify that Splunk has stored the shared secret in encrypted form rather than leaving the original plaintext value visible.
+
+-------------------------------------------------------------------------------------------------------------------------
+
+## 7. Configure the Indexer Peers
+
+On each indexer, edit:
+
+```text
+/opt/splunk/etc/system/local/server.conf
+```
+
+Add:
+
+```ini
+[replication_port://9887]
+
+[clustering]
+mode = peer
+manager_uri = https://<CLUSTER_MANAGER_HOST_OR_IP>:8089
+pass4SymmKey = <INDEXER_CLUSTER_SECRET>
+cluster_label = main_cluster
+```
+
+The `pass4SymmKey` must match the shared secret configured for the indexer cluster.
+
+Restart Splunk on each indexer.
+
+### Validation
+
+From the Cluster Manager Splunk Web interface, navigate to:
+
+**Settings > Indexer Clustering > Peers**
+
+Confirm that the indexers appear and report an **Up** status.
+
+------------------------------------------------------------------------------------------------------------------------------
+
+## 8. Enable the Indexers to Receive Forwarded Data
+
+Enable the receiving port used by the Universal Forwarders:
+
+```bash
+/opt/splunk/bin/splunk enable listen 9997
+```
+
+This allows the indexer tier to accept forwarded Splunk data on TCP port `9997`.
+
+----------------------------------------------------------------------------------------------------------------------
+
+## 9. Initialize the Search Head Cluster
+
+Run the Search Head Cluster initialization command on each search head, substituting the correct hostnames or IP addresses:
+
+```bash
+/opt/splunk/bin/splunk init shcluster-config \
+  -mgmt_uri https://<SEARCH_HEAD_HOST_OR_IP>:8089 \
+  -replication_port 9887 \
+  -replication_factor 1 \
+  -conf_deploy_fetch_url https://<DEPLOYER_HOST_OR_IP>:8089 \
+  -secret <SEARCH_HEAD_CLUSTER_SECRET> \
+  -shcluster_label main_shcluster
+```
+
+Restart Splunk on the search heads after initialization.
+
+Bootstrap the Search Head Cluster captain from the designated search head used for this step:
+
+```bash
+/opt/splunk/bin/splunk bootstrap shcluster-captain \
+  -servers_list "https://<SH1>:8089,https://<SH2>:8089,https://<SH3>:8089"
+```
+
+### Validation
+
+Check Search Head Cluster health:
+
+```bash
+/opt/splunk/bin/splunk show shcluster-status
+```
+
+All members of the Search Head Cluster must use the same Search Head Cluster secret. The original capstone also notes that the Search Head Cluster secret should be different from the indexer-cluster secret in a production environment.
+
+-----------------------------------------------------------------------------------------------------------------------------
+
+## 10. Configure the Deployer
+
+On the Deployer, edit:
+
+```text
+/opt/splunk/etc/system/local/server.conf
+```
+
+Add:
+
+```ini
+[shclustering]
+pass4SymmKey = <SEARCH_HEAD_CLUSTER_SECRET>
+```
+
+Restart Splunk after saving the configuration.
+
+------------------------------------------------------------------------------------------------------------------------
+
+## 11. Test an App Deployment to the Search Head Cluster
+
+On the Deployer, create a simple test app beneath the Search Head Cluster app staging directory:
+
+```bash
+cd /opt/splunk/etc/shcluster/apps/
+mkdir -p testing/local
+nano testing/local/test.txt
+```
+
+Add test content to `test.txt`, save the file, and apply the Search Head Cluster bundle:
+
+```bash
+/opt/splunk/bin/splunk apply shcluster-bundle \
+  -target https://<SEARCH_HEAD_CAPTAIN_HOST_OR_IP>:8089
+```
+
+### Validation
+
+On the search heads, verify that the test app is present under:
+
+```text
+/opt/splunk/etc/apps/
+```
+
+> **Operational note:** Coordinate bundle pushes in shared or production environments. A deployment can include other staged changes, so verify what is pending before applying a bundle.
+
+------------------------------------------------------------------------------------------------------------------------------
+
+## 12. Connect the Search Head Cluster to the Indexer Cluster
+
+On each search head, edit:
+
+```text
+/opt/splunk/etc/system/local/server.conf
+```
+
+Add:
+
+```ini
+[clustering]
+manager_uri = https://<CLUSTER_MANAGER_HOST_OR_IP>:8089
+mode = searchhead
+pass4SymmKey = <INDEXER_CLUSTER_SECRET>
+```
+
+Restart Splunk.
+
+### Validation
+
+On the Cluster Manager, navigate to:
+
+**Settings > Indexer Clustering > Search Heads**
+
+Confirm that the search heads are registered with the indexer cluster.
+
+--------------------------------------------------------------------------------------------------------------------
+
+## 13. Install the Universal Forwarder
+
+Download the 64-bit Linux Universal Forwarder `.tgz` package to the monitored AWS Linux host and extract it under `/opt`:
+
+```bash
+sudo tar -zxvf <splunk-universal-forwarder-package.tgz> -C /opt/
+```
+
+Create a dedicated forwarder account:
+
+```bash
+sudo useradd splunkfwd
+sudo chown -R splunkfwd:splunkfwd /opt/splunkforwarder/
+```
+
+Switch to the forwarder account:
+
+```bash
+sudo su - splunkfwd
+```
+
+Start the Universal Forwarder:
+
+```bash
+/opt/splunkforwarder/bin/splunk start --accept-license --answer-yes
+```
+
+### Validation
+
+Confirm that the Universal Forwarder starts successfully and reports no startup errors.
+
+-------------------------------------------------------------------------------------------------------------------------
+
+## 14. Configure the Universal Forwarder as a Deployment Client
+
+On the Universal Forwarder, create or edit:
+
+```text
+/opt/splunkforwarder/etc/system/local/deploymentclient.conf
+```
+
+Add:
+
+```ini
+[deployment-client]
+
+[target-broker:deploymentServer]
+targetUri = https://<DEPLOYMENT_SERVER_HOST_OR_IP>:8089
+```
+
+Restart the Universal Forwarder.
+
+After startup, the forwarder contacts the Deployment Server and checks whether it belongs to a server class with apps assigned to it.
+
+--------------------------------------------------------------------------------------------------------------------
+
+## 15. Configure `outputs.conf` for Forwarding
+
+On the Deployment Server, create an app for the forwarder output configuration:
+
+```bash
+cd /opt/splunk/etc/deployment-apps/
+mkdir -p all_outputs/default
+nano all_outputs/default/outputs.conf
+```
+
+Add the configuration documented in the lab, replacing the placeholders with the indexer addresses:
+
+```ini
+[tcpout]
+defaultGroup = idxgroup
+
+[tcpout:idxgroup]
+server = <INDEXER_1_HOST_OR_IP>:9997,<INDEXER_2_HOST_OR_IP>:9997
+
+[tcpout-server://<INDEXER_1_HOST_OR_IP>:9997]
+
+[tcpout-server://<INDEXER_2_HOST_OR_IP>:9997]
+```
+
+This configuration defines the forwarding destination for the Universal Forwarder.
+
+------------------------------------------------------------------------------------------------------------------------
+
+## 16. Configure `inputs.conf` for Linux Security Data
+
+On the Deployment Server, create the Linux security input app:
+
+```bash
+cd /opt/splunk/etc/deployment-apps/
+mkdir -p linux_secure/default
+nano linux_secure/default/inputs.conf
+```
+
+Add:
+
+```ini
+[monitor:///opt/splunkforwarder/linux_secure/linux_security.log]
+index = linux_secure
+sourcetype = linux:secure:csv
+disabled = 0
+```
+
+This monitor input tells the Universal Forwarder to watch the sample Linux security log file and send events to the `linux_secure` index using the `linux:secure:csv` sourcetype.
+
+---------------------------------------------------------------------------------------------------------------------
+
+## 17. Create the `linux_secure` Index on the Indexer Cluster
+
+On the Cluster Manager, create an indexer-cluster app:
+
+```bash
+cd /opt/splunk/etc/manager-apps/
+mkdir -p all_indexers/default
+nano all_indexers/default/indexes.conf
+```
+
+Add:
+
+```ini
+[linux_secure]
+homePath = /opt/splunk/var/lib/splunk/linux_secure/db
+coldPath = /opt/splunk/var/lib/splunk/linux_secure/colddb
+thawedPath = /opt/splunk/var/lib/splunk/linux_secure/thaweddb
+```
+
+Apply the cluster bundle:
+
+```bash
+/opt/splunk/bin/splunk apply cluster-bundle
+```
+
+### Validation
+
+Check the bundle status:
+
+```bash
+/opt/splunk/bin/splunk show cluster-bundle-status
+```
+
+Confirm that the bundle validation reports success and verify that the deployed app is present under:
+
+```text
+/opt/splunk/etc/peer-apps/
+```
+
+on the indexers.
+
+------------------------------------------------------------------------------------------------------------------------------
+
+## 18. Make the Index Available to the Search Layer
+
+The original capstone also stages the `linux_secure` index definition through the Search Head Cluster Deployer.
+
+On the Deployer:
+
+```bash
+cd /opt/splunk/etc/shcluster/apps/
+mkdir -p all_indexers/default
+nano all_indexers/default/indexes.conf
+```
+
+The documented stanza is:
+
+```ini
+[linux_secure]
+homePath = /opt/splunk/var/lib/splunk/linux_secure/db
+coldPath = /opt/splunk/var/lib/splunk/linux_secure/colddb
+thawedPath = /opt/splunk/var/lib/splunk/linux_secure/thaweddb
+```
+
+Apply the Search Head Cluster bundle:
+
+```bash
+/opt/splunk/bin/splunk apply shcluster-bundle \
+  -target https://<SEARCH_HEAD_CAPTAIN_HOST_OR_IP>:8089
+```
+
+### Validation
+
+Verify that the app is present on the search heads:
+
+```bash
+ls /opt/splunk/etc/apps/
+```
+
+-----------------------------------------------------------------------------------------------------------------------
+
+## 19. Create and Manage Deployment Server Classes
+
+On the Deployment Server, create or edit:
+
+```text
+/opt/splunk/etc/system/local/serverclass.conf
+```
+
+Add the server classes documented in the project:
+
+```ini
+[serverClass:All_Forwarders]
+whitelist.0 = *
+
+[serverClass:All_Forwarders:app:all_outputs]
+restartSplunkd = true
+
+[serverClass:Linux_secure]
+whitelist.0 = *
+
+[serverClass:Linux_secure:app:linux_secure]
+restartSplunkd = true
+```
+
+Reload the Deployment Server configuration:
+
+```bash
+/opt/splunk/bin/splunk reload deploy-server
+```
+
+### Validation
+
+On the Universal Forwarder, verify that the assigned apps have been deployed:
+
+```bash
+ls /opt/splunkforwarder/etc/apps/
+```
+
+The wildcard (`*`) whitelists above reflect the original lab configuration. In a larger environment, server-class membership should be scoped to the intended clients rather than assuming every forwarder belongs to every class.
+
+-----------------------------------------------------------------------------------------------------------------------------
+
+## 20. Generate Sample Linux Security Events
+
+The monitored file is:
+
+```text
+/opt/splunkforwarder/linux_secure/linux_security.log
+```
+
+Create the **parent directory** first:
+
+```bash
+mkdir -p /opt/splunkforwarder/linux_secure
+```
+
+Then create the sample CSV log file:
+
+```bash
+cat > /opt/splunkforwarder/linux_secure/linux_security.log <<'EOF'
+timestamp,host,facility,process,pid,severity,message,user,src_ip,status,log_source
+2026-10-06T10:15:12-04:00,linux-web-01,auth,sshd,46201,info,"Accepted password for jsmith from 192.168.10.25 port 51422 ssh2",jsmith,192.168.10.25,success,/var/log/auth.log
+2026-10-06T10:17:31-04:00,linux-web-01,auth,sshd,46202,warning,"Failed password for invalid user admin from 203.0.113.45 port 44118 ssh2",admin,203.0.113.45,failure,/var/log/auth.log
+2026-10-06T10:18:04-04:00,linux-web-01,auth,sshd,46203,warning,"Failed password for root from 203.0.113.45 port 44144 ssh2",root,203.0.113.45,failure,/var/log/auth.log
+2026-10-06T10:22:18-04:00,linux-web-01,auth,sshd,46204,info,"Accepted publickey for splunkadmin from 192.168.10.30 port 52211 ssh2",splunkadmin,192.168.10.30,success,/var/log/auth.log
+EOF
+```
+
+The source document defined an 11-column CSV header but omitted the final `log_source` value from some sample rows. The public version above keeps the documented schema consistent by supplying `/var/log/auth.log` for each sample event.
+
+
+
+### Final Validation
+
+From a Search Head, search the Linux security index:
+
+```spl
+index=linux_secure sourcetype="linux:secure:csv"
+```
+
+Confirm that the generated events are searchable from the Search Head Cluster.
+
+--------------------------------------------------------------------------------------------------------------------
+
+# Configuration Flow
+
+At a high level, the documented data and configuration flow is:
+
+Deployment Server
+    |-- deploys outputs.conf --> Universal Forwarder
+    |-- deploys inputs.conf  --> Universal Forwarder
+
+Universal Forwarder
+    |-- monitors linux_security.log
+    |-- forwards events on TCP/9997
+    v
+Indexer Cluster
+    |-- indexes data in linux_secure
+    v
+Search Head Cluster
+    |-- searches linux_secure data
+
+Cluster Manager
+    |-- manages Indexer Cluster configuration/bundles
+
+Deployer
+    |-- manages Search Head Cluster apps/bundles
+```
+
+---------------------------------------------------------------------------------------------------------------------
+
+# Validation Checklist
+
+- [ ] Splunk Enterprise is running on all intended Splunk Enterprise nodes.
+- [ ] Splunk Web is disabled on the indexers as configured in the lab.
+- [ ] Indexer peers show **Up** on the Cluster Manager.
+- [ ] Search Head Cluster reports a healthy status.
+- [ ] Search heads are registered with the indexer cluster.
+- [ ] Universal Forwarder starts successfully.
+- [ ] Universal Forwarder phones home to the Deployment Server.
+- [ ] `all_outputs` and `linux_secure` apps are deployed to the intended forwarder.
+- [ ] `linux_secure` index configuration is deployed to the indexer cluster.
+- [ ] Sample Linux security events are searchable from the Search Head Cluster.
+
+-----------------------------------------------------------------------------------------------------------------------
+
+# Repository Safety Checklist
+
+Before publishing this project:
+
+- Replace real AWS IP addresses and host-specific addresses with placeholders.
+- Remove Splunk administrator passwords.
+- Remove `pass4SymmKey` and Search Head Cluster secrets.
+- Do not commit AWS private keys, access keys, session tokens, or `.pem` files.
+- Review screenshots, terminal output, and configuration files for credentials or identifying information.
+- Keep production security-group rules more restrictive than a general-purpose lab configuration.
+
+------------------------------------------------------------------------------------------------------------------------
+
+# Current Scope and Future Work
+
+Potential future additions, once implemented and validated, include:
+
+- Windows Universal Forwarder deployment and Windows Event Log inputs.
+- Firewall data onboarding.
+- Sourcetype-specific parsing configuration such as `props.conf` where required.
+- TLS-secured forwarding and certificate configuration.
+- More restrictive AWS network controls and production-oriented hardening.
+- Monitoring and health-check dashboards for the distributed Splunk environment.
+
+------------------------------------------------------------------------------------------------------------------------
+
+## Disclaimer
+
+This repository documents a hands-on lab/capstone environment. Values such as instance sizes, storage settings, replication/search factors, ports, security-group rules, and disk thresholds reflect the documented lab and should not automatically be treated as production design recommendations.
